@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  # Service de collecte des APIs (OpenAQ)
+  air-quality-collector:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: openaq_ingestion_service
+    # Charge le fichier .env pour récupérer ENV, PROJECT_ID et SECRET_ID
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+      # Montage crucial pour que le code en local puisse accéder aux 
+      # credentials par défaut de votre machine pour SM
+      - ~/.config/gcloud:/root/.config/gcloud
+    restart: on-failure
+    networks:
+      - data-pipeline-net
+
+networks:
+  data-pipeline-net:
+    driver: bridge

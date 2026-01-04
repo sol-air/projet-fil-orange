@@ -1,0 +1,51 @@
+name: Data Pipeline CI/CD
+
+on:
+  push:
+    branches: [ main, develop ]
+  # Déclenche le pipeline lors d'une Pull Request vers main
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  # Test unitaire et Linting
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install flake8
+      - name: Lint code
+        run: flake8 . --count --max-line-length=100 --statistics
+
+  # Déploiement en PROD (Uniquement sur merge/push sur MAIN)
+  deploy-prod:
+    needs: test 
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to Docker Hub (ou AWS ECR / GCP Artifact Registry)
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: votre-utilisateur/openaq-prod:latest
+
+      - name: Deploy to Production (ex: SSH vers EC2 ou Trigger Cloud Run)
+        run: |
+          echo "Déploiement de la nouvelle image sur l'infrastructure de production..."
+          # Ici vous ajouteriez la commande pour redémarrer votre conteneur sur AWS/GCP

@@ -1,41 +1,40 @@
 import os
 import requests
 import pandas as pd
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from google.cloud import bigquery
 import sys
 from pathlib import Path
 
-# Gestion des chemins pour les imports locaux
+# 1. Gestion des chemins pour les imports locaux
 root_path = Path(__file__).resolve().parent.parent.parent
 sys.path.append(str(root_path))
-from src.utils.creds_gcp import create_bq_client, get_api_key
+from src.utils.creds_gcp import create_bq_client
 
 # CONFIGURATION
 PROJECT_ID = "project-fil-orange"
 DATASET_ID = "load_air_quality"
 TABLE_ID = f"{PROJECT_ID}.{DATASET_ID}.raw_measurements"
 COUNTRY_ID = 22  # France
-ROLLING_WINDOW_DAYS = 3 # Nbr jour incremental
-SECRET_NAME = "OPEN_QUALITY_API_KEY" 
 
-def clean_previous_days(bq_client, start_date_iso):
+def get_last_checkpoint(bq_client):
     """
-    Supprime les données dans BigQuery à partir de la date de début
-    pour permettre un rechargement propre (Idempotence).
+    Récupère la date la plus récente dans BigQuery pour éviter les doublons.
     """
-    print(f"Nettoyage des données BigQuery à partir du {start_date_iso}...")
-    
-    query = f"""
-        DELETE FROM `{TABLE_ID}` 
-        WHERE date_utc >= TIMESTAMP('{start_date_iso}')
-    """
+    query = f"SELECT MAX(date_utc) as last_date FROM `{TABLE_ID}`"
     try:
         query_job = bq_client.query(query)
-        query_job.result() 
-        print("Nettoyage terminé avec succès.")
-    except Exception as e:
-        print(f"Attention: Le nettoyage a échoué (table peut-être inexistante) : {e}")
+        result = query_job.to_dataframe()
+        last_date = result['last_date'].iloc[0]
+        
+        if pd.isna(last_date):
+            return "2025-01-01"
+        
+        new_start = (last_date + timedelta(seconds=1)).strftime('%Y-%m-%d')
+        return new_start
+    except Exception:
+        # Si la table n'existe pas encore ou erreur
+        return "2025-01-01"
 
 def fetch_active_locations(api_key):
     """
@@ -57,14 +56,14 @@ def fetch_active_locations(api_key):
 
     return res.json().get('results', [])
 
-def fetch_sensor_measurements(api_key, sensor_id, date_from_iso):
+def fetch_sensor_measurements(api_key, sensor_id, date_from):
     """
-    Récupère les mesures d'un CAPTEUR spécifique depuis date_from.
+    Récupère les mesures d'un CAPTEUR spécifique (Route V3 officielle).
     """
     url = f"https://api.openaq.org/v3/sensors/{sensor_id}/measurements"
     params = {
-        "date_from": date_from_iso,
-        "limit": 1000 
+        "date_from": date_from,
+        "limit": 1000
     }
     headers = {"X-API-Key": api_key}
     
@@ -80,11 +79,10 @@ def fetch_sensor_measurements(api_key, sensor_id, date_from_iso):
 
 def load_to_bigquery(bq_client, df):
     """
-    Insère les données dans BigQuery en mode APPEND.
-    (Le nettoyage préalable a déjà été fait via clean_previous_days)
+    Insère les données dans BigQuery en mode APPEND avec partitionnement.
     """
     job_config = bigquery.LoadJobConfig(
-        write_disposition="WRITE_APPEND", 
+        write_disposition="WRITE_APPEND",
         time_partitioning=bigquery.TimePartitioning(
             type_=bigquery.TimePartitioningType.DAY,
             field="date_utc"
@@ -93,45 +91,36 @@ def load_to_bigquery(bq_client, df):
     )
 
     print(f"Chargement de {len(df)} lignes dans BigQuery...")
-    try:
-        job = bq_client.load_table_from_dataframe(df, TABLE_ID, job_config=job_config)
-        job.result()
-    except Exception as e:
-        print(f"Erreur lors du chargement BQ: {e}")
+    job = bq_client.load_table_from_dataframe(df, TABLE_ID, job_config=job_config)
+    job.result()
 
 def main():
+    # A. Initialisation
     client = create_bq_client()
-    print(f"Récupération du secret '{SECRET_NAME}'...")
-    try:
-        api_key = get_api_key(SECRET_NAME)
-    except Exception as e:
-        print(f"ERREUR CRITIQUE : Impossible de récupérer la clé API via get_api_key(). {e}")
-        return
-
+    api_key = os.getenv("OPEN_QUALITY_API_KEY")
+    
     if not api_key:
-        print(f"ERREUR : La clé API '{SECRET_NAME}' est vide ou introuvable.")
+        print("ERREUR : Variable OPEN_QUALITY_API_KEY manquante.")
         return
 
-    cutoff_date = datetime.now(timezone.utc) - timedelta(days=ROLLING_WINDOW_DAYS)
-    cutoff_date_iso = cutoff_date.strftime('%Y-%m-%dT%H:%M:%SZ')
+    # B. Calcul du point de départ
+    checkpoint = get_last_checkpoint(client)
+    print(f"Début de l'extraction incrémentale depuis : {checkpoint}")
 
-    print(f"Mode Incrémental Glissant : Récupération à partir du {cutoff_date_iso} (-{ROLLING_WINDOW_DAYS} jours)")
-
-    clean_previous_days(client, cutoff_date_iso)
-
+    # C. Récupération des stations
     locations = fetch_active_locations(api_key)
     if not locations:
         print("Aucune station trouvée.")
         return
     
     all_data = []
-
+    
     for loc in locations:
         loc_id = loc['id']
         loc_name = loc['name']
         sensors = loc.get('sensors', [])
         
-        print(f"Traitement Station : {loc_name} (ID: {loc_id}) | {len(sensors)} capteurs...")
+        print(f"Station : {loc_name} (ID: {loc_id}) | {len(sensors)} capteurs.")
         
         for sensor in sensors:
             sensor_id = sensor['id']
@@ -139,7 +128,7 @@ def main():
             parameter_name = param_info.get('name', 'unknown')
             unit = param_info.get('units', 'unknown')
             
-            measurements = fetch_sensor_measurements(api_key, sensor_id, cutoff_date_iso)
+            measurements = fetch_sensor_measurements(api_key, sensor_id, checkpoint)
             
             for m in measurements:
                 period = m.get('period')
@@ -155,19 +144,17 @@ def main():
                     "parameter": parameter_name,
                     "value": m['value'],
                     "unit": unit,
-                    "date_utc": date_val,
-                    "ingestion_date": datetime.now(timezone.utc) 
+                    "date_utc": date_val
                 })
-                
+
     if all_data:
         df = pd.DataFrame(all_data)
         df['date_utc'] = pd.to_datetime(df['date_utc'])
-        df['ingestion_date'] = pd.to_datetime(df['ingestion_date'])
         
         load_to_bigquery(client, df)
-        print(f"Succès : Pipeline terminé. {len(df)} lignes rechargées (J-{ROLLING_WINDOW_DAYS} à aujourd'hui).")
+        print(f"Succès : Pipeline terminé. {len(df)} nouvelles lignes insérées.")
     else:
-        print("Aucune donnée récupérée pour cette période.")
+        print("Aucune nouvelle donnée disponible à partir de cette date.")
 
 if __name__ == "__main__":
     main()

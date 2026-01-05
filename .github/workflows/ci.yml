@@ -8,7 +8,7 @@ on:
     branches: [ main ]
 
 jobs:
-  # Test unitaire et Linting
+  # Étape de tests et linting
   test:
     runs-on: ubuntu-latest
     steps:
@@ -24,7 +24,7 @@ jobs:
       - name: Lint code
         run: flake8 . --count --max-line-length=100 --statistics
 
-  # Déploiement en PROD (Uniquement sur merge/push sur MAIN)
+  # Déploiement en PROD (Sur merge/push sur MAIN)
   deploy-prod:
     needs: test 
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -43,9 +43,8 @@ jobs:
         with:
           context: .
           push: true
-          tags: votre-utilisateur/openaq-prod:latest
+          tags: kylian-openaq/openaq-prod:latest
 
       - name: Deploy to Production (ex: SSH vers EC2 ou Trigger Cloud Run)
         run: |
           echo "Déploiement de la nouvelle image sur l'infrastructure de production..."
-          # Ici vous ajouteriez la commande pour redémarrer votre conteneur sur AWS/GCP
